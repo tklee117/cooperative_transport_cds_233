@@ -1,0 +1,337 @@
+Project Idea: Decentralized multi-agent payload transport
+
+= System Description
+
+== Chosen Nonlinear System
+
+We study a cooperative manipulation system consisting of two quadrupedal robots
+(Unitree Go2), each equipped with a four-joint arm (Unitree D1) whose
+end-effector is a flat contact pad. The two robots must coordinate to
+*pinch, lift, and transport* a rigid payload through physical contact forces
+alone --- without any rigid mechanical coupling or inter-robot communication.
+This system is motivated by real-world logistics and construction scenarios
+where large, ungraspable objects must be moved by teams of legged robots
+capable of traversing unstructured terrain.
+
+*Modeling assumptions.* The Unitree Go2 has 12 leg joints (3 per leg $times$ 4
+legs). We do not include these as generalized coordinates in the high-level
+model for two reasons. First, the leg joints will be governed by a pre-trained, frozen
+low-level locomotion policy that accepts base velocity commands and outputs
+leg joint targets. From the perspective of the high-level manipulation task,
+the legs form an inner feedback loop and the base behaves as a
+velocity-controlled rigid body; the relevant state is therefore the base pose,
+not the individual leg configurations. Second, including all 12 leg joints per
+robot would expand the zero dynamics to over 60 dimensions, which is
+intractable for symbolic analysis. This simplification is standard in the
+legged manipulation literature. We retain the full 4-DOF arm (Unitree D1) since
+arm joint angles directly determine end-effector contact forces and are the
+primary actuated degrees of freedom in the manipulation task.
+
+The configuration of the full system is:
+
+$
+q = (q_1^b, theta_1^a, q_2^b, theta_2^a, p) in RR^26
+$
+
+where:
+- $q_r^b = (x_r, y_r, z_r, phi_r, theta_r, psi_r) in RR^6$ is the
+  floating-base pose of robot $r$,
+- $theta_r^a = (theta_(r,1)^a, theta_(r,2)^a, theta_(r,3)^a, theta_(r,4)^a)
+  in RR^4$ are the four revolute arm joint angles of robot $r$,
+- $p = (p_x, p_y, p_z, alpha, beta, gamma) in RR^6$ is the 6-DOF payload
+  pose.
+
+The total system has $n = 10 + 10 + 6 = 26$ degrees of freedom. The control
+inputs are the arm joint torques $u = (tau_1^a, tau_2^a) in RR^8$ (4 torques
+per robot), and the contact wrenches $F = (F_1, F_2) in RR^12$ act as
+constraint forces at the two end-effector contact frames. The leg joints are
+not control inputs at this level; base velocity commands are treated as
+outputs of the high-level policy passed to the low-level locomotion controller.
+
+== Nonlinear Differential Equations
+
+The equations of motion are derived from the Euler--Lagrange equations for
+the Lagrangian $cal(L)(q, dot(q)) = T(q, dot(q)) - P(q)$, where the total
+kinetic energy is:
+
+$
+T = 1/2 dot(q)^T D(q) dot(q)
+$
+
+with block-diagonal inertia matrix:
+
+$
+D(q) = mat(
+  D_11(q_1), 0, 0;
+  0, D_22(q_2), 0;
+  0, 0, D_(o o)(p)
+) in RR^(26 times 26)
+$
+
+Each robot block captures the floating-base inertia and the arm's
+contribution through its end-effector Jacobian $J_r^("ee")$:
+
+$
+D_(r r)(q_r) = mat(
+  m_r I_3 + m_e (J_r^"ee")^T J_r^"ee"|_"pos", dots.c;
+  dots.c, W_r^T I_r W_r + m_e (J_r^"ee")^T J_r^"ee"|_"rot"
+) in RR^(10 times 10)
+$
+where $W_r(phi_r, theta_r) in RR^(3 times 3)$ is the kinematic mapping from
+ZYX Euler angle rates to body-frame angular velocity:
+
+$
+W_r = mat(
+  1, 0, -sin theta_r;
+  0, cos phi_r, cos theta_r sin phi_r;
+  0, -sin phi_r, cos theta_r cos phi_r
+)
+$
+
+Note that $W_r$ becomes singular at $theta_r = plus.minus pi\/2$ (gimbal
+lock), so the relative degree analysis in the following section is restricted
+to the domain $theta_r in (-pi\/2, pi\/2)$.
+
+The payload inertia block is:
+
+$
+D_(o o)(p) = mat(m_o I_3, 0; 0, W_o^T I_o W_o) in RR^(6 times 6)
+$
+
+The potential energy is:
+
+$
+P(q) = m_1 g z_1 + m_2 g z_2
+      + m_e g z_1^"ee"(q_1) + m_e g z_2^"ee"(q_2)
+      + m_o g p_z
+$
+
+yielding the gravity vector $G(q) = (partial P \/ partial q)^T in RR^26$.
+
+Applying the Euler--Lagrange equations with holonomic contact constraints
+(following Lecture 26), the full equations of motion are:
+
+$
+D(q) dot.double(q) + C(q, dot(q)) dot(q) + G(q) = B u + J_kappa (q)^T F
+$
+
+where:
+- $C(q, dot(q)) in RR^(26 times 26)$ contains the Coriolis and centripetal
+  terms, including the $omega times (I_o omega)$ Euler term for the
+  rotating payload,
+- $B in RR^(26 times 8)$ is the actuation matrix selecting the eight arm
+  joint torques (4 per robot); it has zero rows corresponding to the
+  floating-base and payload DOF, reflecting the underactuation of the system,
+- $J_kappa(q) in RR^(12 times 26)$ is the stacked contact Jacobian
+  enforcing the 6-DOF end-effector constraints for each robot:
+
+$
+kappa_r (q_r, p) = 0, quad r = 1, 2
+$
+
+These constraints require that each arm's end-effector position and
+orientation coincide with the designated contact frame $attach(T, tl: b, br: c f, tr: (r))$
+on the payload surface. Differentiating twice gives the constraint on
+accelerations:
+
+
+$
+J_kappa (q) dot.double(q) = -dot(J)_kappa (q, dot(q)) dot(q)
+$
+
+and the contact forces $F$ are the Lagrange multipliers enforcing this,
+subject to the friction-cone admissibility constraint:
+
+$
+F_r in cal(A C)(F_r) = {F_r in RR^6 : F_n^((r)) > 0, norm(F_t^((r))) <= mu F_n^((r))}
+$
+
+where $F_n^((r))$ is the normal force component (positive = pushing into the
+payload surface, since there is no adhesion) and $F_t^((r))$ is the tangential
+force component bounded by the friction coefficient $mu$.
+
+Written as a first-order control-affine system with state
+$x = (q, dot(q)) in RR^52$:
+
+$
+dot(x) = underbrace(
+  vec(dot(q), -D(q)^(-1)(C(q,dot(q))dot(q) + G(q))),
+  f(x)
+)
++
+underbrace(
+  mat(0_(26 times 8); D(q)^(-1) B),
+  g_u (x)
+) u
++
+underbrace(
+  mat(0_(26 times 12); D(q)^(-1) J_kappa(q)^T),
+  g_F (x)
+) F
+$
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+== Feedback Linearization and Zero Dynamics 
+=== Output selection 
+
+We choose the 6-DOF payload pose error as the output, encoding the control
+objective of tracking a desired payload trajectory $p_d(t)$:
+
+$
+y(q, t) = mat(
+  p_(x y z)(q) - p_d^(x y z)(t);
+  e_R (q, t)
+) in RR^6
+$
+
+where $p_(x y z)(q) in RR^3$ is the payload position extracted from $q$, and
+$e_R(q, t) = "Log"(R_d^T R_o(q)) in RR^3$ is the orientation error via the
+matrix logarithm, with $R_o(q) in S O(3)$ the payload rotation and $R_d(t)$
+the desired rotation. This map is smooth and well-defined on the domain
+$norm(e_R) < pi$, i.e., excluding $180 degree$ rotations. This is a virtual constraint output of the form
+$y(q, t) = y_a (q) - y_d (t)$, where $y_a(q)$ encodes the actual payload pose
+and $y_d(t)$ the desired trajectory.
+
+=== Relative Degree
+
+We determine the relative degree by differentiating $y$ along solutions of the
+equations of motion. Since $y$ depends on $q$ but not $dot(q)$, the first
+time derivative is:
+
+$
+dot(y) = (partial y) / (partial q) dot(q) = J_y (q) dot(q) - dot(y)_d (t)
+$
+
+where $J_y(q) = (partial y_a) / (partial q) in RR^(6 times 26)$ is the
+output Jacobian. The control input $u$ does not appear in $dot(y)$, so
+$L_g h(x) equiv 0$.
+
+Differentiating a second time and substituting the equations of motion:
+
+$
+dot.double(y) = underbrace(
+  dot(J)_y (q, dot(q)) dot(q) + J_y (q) (- D(q)^(-1) (C(q, dot(q)) dot(q) + G(q))) - dot.double(y)_d,
+  L_f^2 y(q, dot(q), t)
+)
++ underbrace(
+  J_y (q) D(q)^(-1) B,
+  cal(G)(q, dot(q))
+) u
+$
+
+The *decoupling matrix* is (following Lecture 18, eq. 18.24 and Lecture 21,
+eq. 21.7):
+
+$
+cal(G)(q, dot(q)) = L_g L_f y = J_y (q) D(q)^(-1) B in RR^(6 times 8)
+$
+
+This matrix has 6 rows (output dimension) and 8 columns (control input
+dimension), so the system is *non-square*. We therefore consider
+$cal(G) cal(G)^T in RR^(6 times 6)$ and use the Moore--Penrose pseudoinverse
+$cal(G)^+ = cal(G)^T (cal(G) cal(G)^T)^(-1)$ for the feedback linearizing
+controller, which exists whenever $cal(G)$ has full row rank (rank 6). This
+holds when the arm Jacobians $J_r^"ee"$ are non-singular, i.e., away from
+kinematic singularities of the D1 arm, and when $theta_r in (-pi\/2, pi\/2)$
+to avoid gimbal lock in $W_r$.
+
+Since $u$ does not appear in $dot(y)$ but does appear in $dot.double(y)$, the
+system has vector relative degree $arrow(gamma) = (2, 2, 2, 2, 2, 2)$, i.e.,
+vector relative degree 2 for all six output components.
+
+=== Feedback Linearizing Controller
+
+Under vector relative degree 2, the output dynamics take the form (Lecture 18,
+eq. 18.25; Lecture 21, eq. 21.5):
+
+$
+dot.double(y) = L_f^2 y(q, dot(q), t) + cal(G)(q, dot(q)) u
+$
+
+Following Proposition 21.1, we feedback linearize by choosing:
+
+$
+u^* = cal(G)^+ (q, dot(q)) (-L_f^2 y(q, dot(q), t) + v)
+$
+
+where $v in RR^6$ is the new auxiliary input, yielding $dot.double(y) = v$.
+To exponentially stabilize the output error, we pick a linear PD law on the
+error coordinates $eta = (y, dot(y)) in RR^12$:
+
+$
+v = -K_P y - K_D dot(y)
+$
+
+with $K_P, K_D in RR^(6 times 6)$ chosen positive definite such that:
+
+$
+A_"cl" = mat(0_6, I_6; -K_P, -K_D) in RR^(12 times 12)
+$
+
+is Hurwitz (all eigenvalues have strictly negative real part). The closed-loop
+output dynamics then satisfy:
+
+$
+dot(eta) = A_"cl" eta ==> eta(t) -> 0 "exponentially as" t -> infinity
+$
+
+This drives $y(q(t), t) -> 0$, i.e., the payload tracks $p_d(t)$
+exponentially from any initial condition in the valid domain.
+
+
+=== Zero Dynamics
+
+When $y equiv 0$ and $dot(y) equiv 0$, the system is constrained to the
+*zero dynamics surface*:
+
+$
+cal(Z) = {(q, dot(q)) : y(q, t) = 0, dot(y)(q, dot(q), t) = 0}
+$
+
+Following Lecture 19 and the MIMO normal form of Lecture 21, the zero dynamics
+evolve on $cal(Z)$ and have dimension:
+
+$
+dim(cal(Z)) = 2n - 2k = 2(26) - 2(6) = 40
+$
+
+where $n = 26$ is the number of generalized coordinates and $k = 6$ is the
+output dimension. The zero dynamics coordinates $z in RR^40$ capture the
+internal degrees of freedom of the system that are not constrained by the
+output: specifically, the arm joint configurations of both robots and their
+rates, and the floating-base poses and rates, subject to $y = 0$.
+
+Physically, the zero dynamics describe how the robot configurations evolve
+while the payload tracks the desired trajectory perfectly. Stability of the
+zero dynamics is what determines whether the robots maintain a consistent,
+non-degenerate formation around the payload --- or whether arm joint angles or
+base poses drift to singularities.
+
+*Symbolic derivation.* Following Lecture 19, the zero dynamics coordinates
+$z(x)$ must satisfy $D z(x) g_u(x) equiv 0$. For our system this reduces to:
+
+$
+(partial z) / (partial q) D(q)^(-1) B equiv 0
+$
+
+This is a system of 40 partial differential equations in 52 unknowns, which is
+not tractable to solve symbolically for a 26-DOF system. We therefore assess
+zero dynamics stability via simulation.
+
+
